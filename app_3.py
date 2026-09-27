@@ -226,6 +226,13 @@ def plot_variant_impact(var_row, window_size=16384):
 # -----------------------------------------------------------------------------
 # USER INTERFACE
 # -----------------------------------------------------------------------------
+
+# Initialize session state for the processed dataframe
+if 'processed_df' not in st.session_state:
+    st.session_state['processed_df'] = None
+if 'last_uploaded_file' not in st.session_state:
+    st.session_state['last_uploaded_file'] = None
+
 st.sidebar.title("🧬 OncoVEP Settings")
 genome_build = st.sidebar.selectbox(
     "Reference Genome Assembly",
@@ -238,6 +245,11 @@ st.caption("Oncology Variant Effect Predictor & Summary Tool")
 st.markdown("---")
 
 uploaded_file = st.file_uploader("Upload a variant file (.txt, .maf, or .vcf)", type=["txt", "vcf", "maf"])
+
+# Clear processed data if a new file is uploaded
+if uploaded_file is not None and uploaded_file.name != st.session_state['last_uploaded_file']:
+    st.session_state['processed_df'] = None
+    st.session_state['last_uploaded_file'] = uploaded_file.name
 
 if uploaded_file is not None:
     st.success(f"File **{uploaded_file.name}** uploaded successfully!")
@@ -257,7 +269,6 @@ if uploaded_file is not None:
             st.dataframe(raw_df.head(100), use_container_width=True)
 
         st.markdown("---")
-        
         st.subheader("⚙️ Step 1: Sequence Extraction, Annotation & Scoring")
         st.write("This step builds the 61 bp sequence contexts, annotates consequences, and computes the Two-Tier disruption metrics.")
         
@@ -265,41 +276,46 @@ if uploaded_file is not None:
         
         if st.button("Run Batch Pre-processing"):
             with st.spinner("Executing extraction and annotation pipeline..."):
+                # Run the batch logic and save to session state memory
                 processed_df = batch_extract_and_annotate(raw_df, build=genome_build, max_variants=batch_limit)
+                st.session_state['processed_df'] = processed_df
                 
-                st.success("Pre-processing Complete! Data is ready for analysis.")
+        # Only render the dashboard if processed data exists in memory
+        if st.session_state['processed_df'] is not None:
+            processed_df = st.session_state['processed_df']
+            st.success("Pre-processing Complete! Data is ready for analysis.")
+            
+            # 1. Output the Annotated Data Table
+            st.dataframe(processed_df, use_container_width=True)
+            
+            # 2. Side-by-Side Visualizations
+            st.markdown("---")
+            st.subheader("📈 Variant Prioritization Dashboard")
+            
+            plot_col1, plot_col2 = st.columns(2)
+            
+            with plot_col1:
+                st.write("**Tier 1 vs Tier 2 Quadrant Classification**")
+                fig_quadrant = plot_two_tier_quadrant(processed_df, carbon_cutoff=0.5, ag_cutoff=0.4)
+                st.pyplot(fig_quadrant)
+            
+            with plot_col2:
+                st.write("**Epigenomic Track Disruption Profile**")
+                # Dropdown will now trigger a rerun safely relying on session_state
+                selected_gene = st.selectbox("Select Variant to Inspect:", processed_df["gene"].unique())
+                selected_row = processed_df[processed_df["gene"] == selected_gene].iloc[0]
                 
-                # 1. Output the Annotated Data Table
-                st.dataframe(processed_df, use_container_width=True)
-                
-                # 2. Side-by-Side Visualizations
-                st.markdown("---")
-                st.subheader("📈 Variant Prioritization Dashboard")
-                
-                plot_col1, plot_col2 = st.columns(2)
-                
-                with plot_col1:
-                    st.write("**Tier 1 vs Tier 2 Quadrant Classification**")
-                    fig_quadrant = plot_two_tier_quadrant(processed_df, carbon_cutoff=0.5, ag_cutoff=0.4)
-                    st.pyplot(fig_quadrant)
-                
-                with plot_col2:
-                    st.write("**Epigenomic Track Disruption Profile**")
-                    # Allow user to select which variant to plot the tracks for
-                    selected_gene = st.selectbox("Select Variant to Inspect:", processed_df["gene"].unique())
-                    selected_row = processed_df[processed_df["gene"] == selected_gene].iloc[0]
-                    
-                    fig_track = plot_variant_impact(selected_row)
-                    st.pyplot(fig_track)
-                
-                # 3. Enable Output Download
-                st.markdown("---")
-                csv = processed_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⬇️ Download Scored & Annotated Data (CSV)",
-                    data=csv,
-                    file_name="oncovep_scored_results.csv",
-                    mime="text/csv",
-                )
+                fig_track = plot_variant_impact(selected_row)
+                st.pyplot(fig_track)
+            
+            # 3. Enable Output Download
+            st.markdown("---")
+            csv = processed_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="⬇️ Download Scored & Annotated Data (CSV)",
+                data=csv,
+                file_name="oncovep_scored_results.csv",
+                mime="text/csv",
+            )
 else:
     st.info("Please upload a `.txt`, `.maf`, or `.vcf` file to begin.")
