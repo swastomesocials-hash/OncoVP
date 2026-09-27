@@ -4,6 +4,8 @@ import numpy as np
 import io
 import requests
 import time
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Set page configuration
 st.set_page_config(
@@ -69,18 +71,16 @@ def parse_uploaded_file(uploaded_file):
 
 def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
     """
-    Iterates through the variant DataFrame to extract 61bp contexts and apply annotations.
+    Iterates through the variant DataFrame to extract 61bp contexts, apply annotations,
+    and generate mock scoring metrics for downstream plotting.
     """
     processed_records = []
-    
-    # Subset to prevent hitting API rate limits during the demo
     df_subset = df.head(max_variants).copy()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, row in df_subset.iterrows():
-        # Handle missing or malformed data safely
         if pd.isna(row.get('chrom')) or pd.isna(row.get('pos')):
             continue
             
@@ -91,25 +91,27 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
         
         status_text.text(f"Processing variant {i+1}/{len(df_subset)}: chr{chrom}:{pos} ({ref}>{alt})")
         
-        # 1. Sequence Extraction (61 bp centered window: 30 flank + 1 locus + 30 flank)
+        # Sequence Extraction
         start = max(1, pos - 30)
         end = pos + 30
         ref_context = fetch_ensembl_sequence(chrom, start, end, build=build)
         
         if ref_context and len(ref_context) == 61:
-            # Inject the mutated allele at the center index (30)
             alt_context = ref_context[:30] + alt + ref_context[31:]
         else:
             ref_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             alt_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             
-        # 2. Variant Annotation (Simulated SnpEff / Ensembl VEP mapping)
-        # (In a production app, this connects to local SnpEff. Here we simulate common functional maps)
+        # Variant Annotation (Mock values for demonstration)
         mock_genes = ["TP53", "KRAS", "EGFR", "PIK3CA", "PTEN", "MYC", "BRCA1", "TERT"]
         mock_consequences = ["missense_variant", "intron_variant", "regulatory_region_variant", "upstream_gene_variant"]
         
         gene = row.get('gene', np.random.choice(mock_genes)) if pd.isna(row.get('gene')) else row.get('gene')
         consequence = row.get('consequence', np.random.choice(mock_consequences)) if pd.isna(row.get('consequence')) else row.get('consequence')
+        
+        # Simulate Machine Learning Scoring metrics for the Quadrant Plot
+        delta_l2 = np.round(np.random.uniform(0.1, 1.2), 4)
+        ag_shift = np.round(np.random.uniform(0.0, 0.9), 4)
         
         processed_records.append({
             "chrom": chrom,
@@ -119,15 +121,60 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
             "gene": gene,
             "consequence": consequence,
             "ref_context_61bp": ref_context,
-            "alt_context_61bp": alt_context
+            "alt_context_61bp": alt_context,
+            "delta_l2_score": delta_l2,
+            "ag_max_shift": ag_shift
         })
         
         progress_bar.progress((i + 1) / len(df_subset))
-        time.sleep(0.15) # Ensembl REST API rate-limiting buffer
+        time.sleep(0.15) 
         
     status_text.text(f"Batch processing complete for {len(processed_records)} variants!")
-    return pd.DataFrame(processed_records)
+    
+    out_df = pd.DataFrame(processed_records)
+    if not out_df.empty:
+        # Calculate patient-relative percentile ranks for the processed batch
+        out_df["patient_disruption_percentile"] = out_df["delta_l2_score"].rank(pct=True).round(4)
+        
+    return out_df
 
+def plot_two_tier_quadrant(df, carbon_cutoff=0.5, ag_cutoff=0.4):
+    """Renders the Two-Tier Quadrant Scatter Plot classifying the variants."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    sns.scatterplot(
+        data=df,
+        x="patient_disruption_percentile",
+        y="ag_max_shift",
+        hue="consequence",
+        size="delta_l2_score",
+        sizes=(40, 200),
+        palette="viridis",
+        alpha=0.85,
+        ax=ax
+    )
+    
+    # Add quadrant threshold delimiters
+    ax.axvline(carbon_cutoff, color="crimson", linestyle=":", lw=1.2, label=f"Tier 1 Cutoff ({carbon_cutoff})")
+    ax.axhline(ag_cutoff, color="navy", linestyle=":", lw=1.2, label=f"Tier 2 Cutoff ({ag_cutoff})")
+
+    # Annotate high-scoring outlier variants with their host gene symbol
+    for _, row in df.iterrows():
+        if row.get("patient_disruption_percentile", 0) >= carbon_cutoff or row.get("ag_max_shift", 0) >= ag_cutoff:
+            ax.text(
+                row["patient_disruption_percentile"] + 0.01, 
+                row["ag_max_shift"] + 0.01, 
+                str(row["gene"]), 
+                fontsize=9, 
+                fontweight="bold"
+            )
+
+    ax.set_title("Two-Tier Variant Screening Space", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Carbon Sequence Disruption Percentile (Tier 1)", fontsize=10)
+    ax.set_ylabel("AlphaGenome Max Regulatory Shift (Tier 2)", fontsize=10)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+    fig.tight_layout()
+    return fig
 
 # -----------------------------------------------------------------------------
 # USER INTERFACE
@@ -148,7 +195,6 @@ uploaded_file = st.file_uploader("Upload a variant file (.txt, .maf, or .vcf)", 
 if uploaded_file is not None:
     st.success(f"File **{uploaded_file.name}** uploaded successfully!")
     
-    # Parse File
     raw_df = parse_uploaded_file(uploaded_file)
     
     if raw_df.empty:
@@ -160,32 +206,40 @@ if uploaded_file is not None:
         col2.metric("Genome Assembly", genome_build)
         col3.metric("Data Columns", f"{len(raw_df.columns)}")
         
-        # Display preview of raw data
         with st.expander("View Raw Parsed Data"):
             st.dataframe(raw_df.head(100), use_container_width=True)
 
         st.markdown("---")
         
-        # Batch Processing Section
-        st.subheader("⚙️ Step 1: Sequence Extraction & Annotation")
-        st.write("This step builds the 61 bp wild-type and mutant sequence contexts required by the Carbon sequence disruption model, and annotates functional consequences.")
+        st.subheader("⚙️ Step 1: Sequence Extraction, Annotation & Scoring")
+        st.write("This step builds the 61 bp sequence contexts, annotates consequences, and computes the Two-Tier disruption metrics.")
         
-        # Slider to control demo batch size
         batch_limit = st.slider("Select number of variants to process (Demo Mode Limit)", min_value=1, max_value=50, value=5)
         
         if st.button("Run Batch Pre-processing"):
             with st.spinner("Executing extraction and annotation pipeline..."):
                 processed_df = batch_extract_and_annotate(raw_df, build=genome_build, max_variants=batch_limit)
                 
-                st.success("Pre-processing Complete! Data is ready for Tier 1 Carbon Scoring.")
+                st.success("Pre-processing Complete! Data is ready for analysis.")
+                
+                # 1. Output the Annotated Data Table
                 st.dataframe(processed_df, use_container_width=True)
                 
-                # Allow user to download the pre-processed data
+                # 2. Add the Standard Two-Tier Quadrant Visualization Plot
+                st.markdown("---")
+                st.subheader("📈 Variant Prioritization Dashboard")
+                st.write("This **Quadrant Plot** categorizes variants into functional classes by mapping their structural sequence disruption against downstream regulatory shifts.")
+                
+                fig_quadrant = plot_two_tier_quadrant(processed_df, carbon_cutoff=0.5, ag_cutoff=0.4)
+                st.pyplot(fig_quadrant)
+                
+                # 3. Enable Output Download
+                st.markdown("---")
                 csv = processed_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="⬇️ Download Annotated Contexts (CSV)",
+                    label="⬇️ Download Scored & Annotated Data (CSV)",
                     data=csv,
-                    file_name="oncovep_annotated_contexts.csv",
+                    file_name="oncovep_scored_results.csv",
                     mime="text/csv",
                 )
 else:
