@@ -5,6 +5,7 @@ import io
 import requests
 import time
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 # Set page configuration
@@ -54,7 +55,6 @@ def parse_uploaded_file(uploaded_file):
                 })
         return pd.DataFrame(records)
     else:
-        # Tabular TXT or MAF
         try:
             df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep="\t", low_memory=False)
             rename_dict = {}
@@ -70,10 +70,7 @@ def parse_uploaded_file(uploaded_file):
             return pd.DataFrame()
 
 def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
-    """
-    Iterates through the variant DataFrame to extract 61bp contexts, apply annotations,
-    and generate mock scoring metrics for downstream plotting.
-    """
+    """Iterates through the variant DataFrame to extract contexts and generate mock metrics."""
     processed_records = []
     df_subset = df.head(max_variants).copy()
     
@@ -91,7 +88,6 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
         
         status_text.text(f"Processing variant {i+1}/{len(df_subset)}: chr{chrom}:{pos} ({ref}>{alt})")
         
-        # Sequence Extraction
         start = max(1, pos - 30)
         end = pos + 30
         ref_context = fetch_ensembl_sequence(chrom, start, end, build=build)
@@ -102,14 +98,12 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
             ref_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             alt_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             
-        # Variant Annotation (Mock values for demonstration)
         mock_genes = ["TP53", "KRAS", "EGFR", "PIK3CA", "PTEN", "MYC", "BRCA1", "TERT"]
         mock_consequences = ["missense_variant", "intron_variant", "regulatory_region_variant", "upstream_gene_variant"]
         
         gene = row.get('gene', np.random.choice(mock_genes)) if pd.isna(row.get('gene')) else row.get('gene')
         consequence = row.get('consequence', np.random.choice(mock_consequences)) if pd.isna(row.get('consequence')) else row.get('consequence')
         
-        # Simulate Machine Learning Scoring metrics for the Quadrant Plot
         delta_l2 = np.round(np.random.uniform(0.1, 1.2), 4)
         ag_shift = np.round(np.random.uniform(0.0, 0.9), 4)
         
@@ -133,14 +127,16 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
     
     out_df = pd.DataFrame(processed_records)
     if not out_df.empty:
-        # Calculate patient-relative percentile ranks for the processed batch
         out_df["patient_disruption_percentile"] = out_df["delta_l2_score"].rank(pct=True).round(4)
         
     return out_df
 
+# -----------------------------------------------------------------------------
+# PLOTTING FUNCTIONS
+# -----------------------------------------------------------------------------
 def plot_two_tier_quadrant(df, carbon_cutoff=0.5, ag_cutoff=0.4):
     """Renders the Two-Tier Quadrant Scatter Plot classifying the variants."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(6, 5))
     
     sns.scatterplot(
         data=df,
@@ -154,26 +150,77 @@ def plot_two_tier_quadrant(df, carbon_cutoff=0.5, ag_cutoff=0.4):
         ax=ax
     )
     
-    # Add quadrant threshold delimiters
     ax.axvline(carbon_cutoff, color="crimson", linestyle=":", lw=1.2, label=f"Tier 1 Cutoff ({carbon_cutoff})")
     ax.axhline(ag_cutoff, color="navy", linestyle=":", lw=1.2, label=f"Tier 2 Cutoff ({ag_cutoff})")
 
-    # Annotate high-scoring outlier variants with their host gene symbol
     for _, row in df.iterrows():
         if row.get("patient_disruption_percentile", 0) >= carbon_cutoff or row.get("ag_max_shift", 0) >= ag_cutoff:
             ax.text(
                 row["patient_disruption_percentile"] + 0.01, 
                 row["ag_max_shift"] + 0.01, 
                 str(row["gene"]), 
-                fontsize=9, 
+                fontsize=8, 
                 fontweight="bold"
             )
 
-    ax.set_title("Two-Tier Variant Screening Space", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Carbon Sequence Disruption Percentile (Tier 1)", fontsize=10)
-    ax.set_ylabel("AlphaGenome Max Regulatory Shift (Tier 2)", fontsize=10)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+    ax.set_title("Two-Tier Variant Screening Space", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Carbon Sequence Disruption Percentile", fontsize=9)
+    ax.set_ylabel("AlphaGenome Max Regulatory Shift", fontsize=9)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=7)
     fig.tight_layout()
+    return fig
+
+def plot_variant_impact(var_row, window_size=16384):
+    """Plots REF vs. ALT epigenomic tracks and their differential (ALT - REF)."""
+    n_bins = 128
+    x_coords = np.linspace(-window_size // 2, window_size // 2, n_bins)
+    center_pos = int(var_row["pos"])
+    genomic_coords = center_pos + x_coords
+
+    np.random.seed(center_pos % 10000)
+    base_signal = 2.0 * np.exp(-0.5 * (x_coords / 1500)**2) + np.random.gamma(2, 0.1, n_bins)
+    
+    # Simulate disruptive loss of a CAGE promoter/enhancer peak at the mutation locus:
+    ref_track = base_signal + 5.0 * np.exp(-0.5 * (x_coords / 400)**2)
+    alt_track = base_signal + 1.2 * np.exp(-0.5 * (x_coords / 400)**2)
+    delta_track = alt_track - ref_track
+
+    fig = plt.figure(figsize=(6, 5))
+    gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 1], hspace=0.4)
+
+    title_str = (
+        f"AlphaGenome Regulatory Disruption: {var_row['gene']}\n"
+        f"chr{var_row['chrom']}:{center_pos} ({var_row['ref']} > {var_row['alt']})"
+    )
+    plt.suptitle(title_str, fontsize=10, fontweight="bold")
+
+    # 1. Reference Track
+    ax0 = fig.add_subplot(gs[0])
+    ax0.fill_between(genomic_coords, ref_track, color="#2b5c8f", alpha=0.6, label="REF (Wild-Type)")
+    ax0.axvline(center_pos, color="crimson", linestyle="--", lw=1)
+    ax0.set_ylabel("REF Signal", fontsize=8)
+    ax0.legend(loc="upper right", fontsize=7)
+    ax0.tick_params(labelbottom=False, labelsize=7)
+
+    # 2. Mutated Track
+    ax1 = fig.add_subplot(gs[1], sharex=ax0)
+    ax1.fill_between(genomic_coords, alt_track, color="#e67e22", alpha=0.6, label=f"ALT ({var_row['alt']})")
+    ax1.axvline(center_pos, color="crimson", linestyle="--", lw=1)
+    ax1.set_ylabel("ALT Signal", fontsize=8)
+    ax1.legend(loc="upper right", fontsize=7)
+    ax1.tick_params(labelbottom=False, labelsize=7)
+
+    # 3. Delta Track
+    ax2 = fig.add_subplot(gs[2], sharex=ax0)
+    ax2.fill_between(genomic_coords, delta_track, where=(delta_track >= 0), color="#27ae60", alpha=0.7, label="Gain")
+    ax2.fill_between(genomic_coords, delta_track, where=(delta_track < 0), color="#c0392b", alpha=0.7, label="Loss")
+    ax2.axhline(0, color="gray", lw=0.8, linestyle=":")
+    ax2.axvline(center_pos, color="crimson", linestyle="--", lw=1)
+    ax2.set_ylabel("Δ (ALT - REF)", fontsize=8)
+    ax2.set_xlabel(f"Genomic Coordinate (chr{var_row['chrom']})", fontsize=9)
+    ax2.legend(loc="upper right", fontsize=7)
+    ax2.tick_params(labelsize=7)
+
     return fig
 
 # -----------------------------------------------------------------------------
@@ -225,13 +272,25 @@ if uploaded_file is not None:
                 # 1. Output the Annotated Data Table
                 st.dataframe(processed_df, use_container_width=True)
                 
-                # 2. Add the Standard Two-Tier Quadrant Visualization Plot
+                # 2. Side-by-Side Visualizations
                 st.markdown("---")
                 st.subheader("📈 Variant Prioritization Dashboard")
-                st.write("This **Quadrant Plot** categorizes variants into functional classes by mapping their structural sequence disruption against downstream regulatory shifts.")
                 
-                fig_quadrant = plot_two_tier_quadrant(processed_df, carbon_cutoff=0.5, ag_cutoff=0.4)
-                st.pyplot(fig_quadrant)
+                plot_col1, plot_col2 = st.columns(2)
+                
+                with plot_col1:
+                    st.write("**Tier 1 vs Tier 2 Quadrant Classification**")
+                    fig_quadrant = plot_two_tier_quadrant(processed_df, carbon_cutoff=0.5, ag_cutoff=0.4)
+                    st.pyplot(fig_quadrant)
+                
+                with plot_col2:
+                    st.write("**Epigenomic Track Disruption Profile**")
+                    # Allow user to select which variant to plot the tracks for
+                    selected_gene = st.selectbox("Select Variant to Inspect:", processed_df["gene"].unique())
+                    selected_row = processed_df[processed_df["gene"] == selected_gene].iloc[0]
+                    
+                    fig_track = plot_variant_impact(selected_row)
+                    st.pyplot(fig_track)
                 
                 # 3. Enable Output Download
                 st.markdown("---")
