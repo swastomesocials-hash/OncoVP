@@ -62,6 +62,21 @@ def parse_uploaded_file(uploaded_file):
         except Exception:
             return pd.DataFrame()
 
+def encode_dna_sequence(seq):
+    """
+    Converts a DNA string into a flattened one-hot encoded numerical array.
+    Required because Random Forest models cannot read raw text.
+    """
+    mapping = {
+        'A': [1, 0, 0, 0],
+        'C': [0, 1, 0, 0],
+        'G': [0, 0, 1, 0],
+        'T': [0, 0, 0, 1]
+    }
+    # For any unknown base 'N' or errors, use [0,0,0,0]
+    encoded = [mapping.get(base.upper(), [0, 0, 0, 0]) for base in seq]
+    return np.array(encoded).flatten()
+
 def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
     processed_records = []
     df_subset = df.head(max_variants).copy()
@@ -87,6 +102,10 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
             ref_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             alt_context = "API_FETCH_FAILED_OR_BOUNDS_ERROR"
             
+        # Feature Engineering: One-hot encode the 61-bp sequences
+        ref_encoded = encode_dna_sequence(ref_context) if "API" not in ref_context else np.zeros(61*4)
+        alt_encoded = encode_dna_sequence(alt_context) if "API" not in alt_context else np.zeros(61*4)
+            
         mock_genes = ["TP53", "KRAS", "EGFR", "PIK3CA", "PTEN", "MYC", "BRCA1", "TERT"]
         mock_consequences = ["missense_variant", "intron_variant", "regulatory_region_variant", "upstream_gene_variant"]
         gene = row.get('gene', np.random.choice(mock_genes)) if pd.isna(row.get('gene')) else row.get('gene')
@@ -98,7 +117,8 @@ def batch_extract_and_annotate(df, build="GRCh38", max_variants=10):
         processed_records.append({
             "chrom": chrom, "pos": pos, "ref": ref, "alt": alt, "gene": gene, 
             "consequence": consequence, "ref_context_61bp": ref_context, 
-            "alt_context_61bp": alt_context, "delta_l2_score": delta_l2, "ag_max_shift": ag_shift
+            "alt_context_61bp": alt_context, "delta_l2_score": delta_l2, "ag_max_shift": ag_shift,
+            "ref_encoded_vector": ref_encoded, "alt_encoded_vector": alt_encoded
         })
         progress_bar.progress((i + 1) / len(df_subset))
         time.sleep(0.15) 
@@ -173,17 +193,14 @@ def plot_variant_impact(var_row, window_size=16384):
     return fig
 
 def plot_ism_heatmap(var_row):
-    """Generates the In Silico Saturation Mutagenesis Heatmap[cite: 1, 2]."""
     seq = var_row.get("ref_context_61bp", "N"*61)
     if len(seq) != 61: 
         seq = "N"*61
     bases = ['A', 'C', 'G', 'T']
     
-    # Simulate ISM disruption scores
     np.random.seed(int(var_row["pos"]) % 10000)
     ism_matrix = np.random.randn(4, 61) * 0.4
     
-    # Force reference bases to 0 (no mutation = no change)
     for i, base in enumerate(seq):
         if base in bases:
             ism_matrix[bases.index(base), i] = 0.0
@@ -193,18 +210,15 @@ def plot_ism_heatmap(var_row):
     ax.set_title("In Silico Saturation Mutagenesis (ISM) - 61bp Window", fontsize=10, fontweight="bold")
     ax.set_xlabel("Genomic Position (centered on mutation locus)", fontsize=9)
     ax.set_ylabel("Substitution", fontsize=9)
-    # Highlight central mutation position
     ax.axvline(30.5, color='black', lw=1.5, linestyle="--")
     fig.tight_layout()
     return fig
 
 def plot_multi_assay_heatmap(var_row):
-    """Generates the stacked Multi-Assay Differential Heatmap[cite: 1, 2]."""
     assays = ["CAGE", "ATAC", "H3K27ac", "CTCF"]
     n_bins = 128
     np.random.seed(int(var_row["pos"]) % 10000)
     
-    # Simulate varying degrees of signal loss/gain across different epigenomic modalities
     delta_matrix = np.zeros((4, n_bins))
     for i in range(4):
         base_shift = np.random.randn() * 3
@@ -268,7 +282,10 @@ if uploaded_file is not None:
         if st.session_state['processed_df'] is not None:
             processed_df = st.session_state['processed_df']
             st.success("Pre-processing Complete! Data is ready for analysis.")
-            st.dataframe(processed_df, use_container_width=True)
+            
+            # Hide the raw encoded arrays from the visible dataframe output for clean UI
+            display_df = processed_df.drop(columns=['ref_encoded_vector', 'alt_encoded_vector'])
+            st.dataframe(display_df, use_container_width=True)
             
             # Row 1 Visualizations
             st.markdown("---")
@@ -287,7 +304,7 @@ if uploaded_file is not None:
                 fig_track = plot_variant_impact(selected_row)
                 st.pyplot(fig_track)
                 
-            # Row 2 Visualizations (New Additions)
+            # Row 2 Visualizations
             st.markdown("---")
             st.subheader("🧬 Advanced Sequence & Modality Profiling")
             adv_col1, adv_col2 = st.columns([1.5, 1])
